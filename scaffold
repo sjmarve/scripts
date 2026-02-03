@@ -61,6 +61,11 @@ show_spinner() {
 
 # Usage: scaffold [-s subdomain] [-b branch]
 
+# Reset variables to prevent persistence from previous sourced runs
+subdomain=""
+new_branch=""
+verbose=false
+
 if [[ "$0" == "$BASH_SOURCE" ]]; then
     echo -e "${RED}Warning: This script is not being sourced. Directory changes (cd) will not persist.${NC}"
     echo -e "${RED}Please ensure you have run 'source ~/.zshrc' and are using the 'scaffold' alias.${NC}"
@@ -110,6 +115,8 @@ if [ -n "$new_branch" ]; then
     fi
     # Re-evaluate variables for the new location
     FOLDER=$(pwd)
+else
+    echo -e "${GREEN}Current directory already a worktree, skipping worktree creation${NC}"
 fi
 
 WORKTREE_NAME=$(basename "$FOLDER")
