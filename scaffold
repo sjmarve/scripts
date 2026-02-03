@@ -1,0 +1,318 @@
+#!/bin/bash
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Reset OPTIND for source compatibility
+OPTIND=1
+
+# Silence Job Control and Tracing
+if [ -n "$ZSH_VERSION" ]; then
+    setopt no_monitor no_xtrace 2>/dev/null
+else
+    set +x
+fi
+
+smart_exit() {
+    # Check if we're in ZSH and if the script is being sourced
+    if [[ -n "$ZSH_VERSION" ]]; then
+        if [[ "$ZSH_EVAL_CONTEXT" == "toplevel" ]]; then
+            exit "$1"
+        else
+            return "$1"
+        fi
+    else
+        # Fallback for Bash
+        if [[ "$0" == "$BASH_SOURCE" ]]; then
+            exit "$1"
+        else
+            return "$1"
+        fi
+    fi
+}
+
+# Spinner function for background processes
+show_spinner() {
+    local pid=$1
+    local message="$2"
+    local delay=0.1
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local i=0
+    
+    # Hide cursor
+    printf "\033[?25l"
+    
+    while kill -0 "$pid" 2>/dev/null; do
+        # Clear line and print message + frame
+        printf "\r\c"
+        printf "\033[K${GREEN}%s [%s]${NC}" "$message" "${frames[i]}"
+        i=$(( (i % ${#frames[@]} ) + 1 ))
+        sleep $delay
+    done
+    
+    # Clear line and print final status
+    printf "\r\033[K${GREEN}%s Done.${NC}\n" "$message"
+    
+    # Restore cursor
+    printf "\033[?25h"
+}
+
+# Usage: scaffold [-s subdomain] [-b branch]
+
+if [[ "$0" == "$BASH_SOURCE" ]]; then
+    echo -e "${RED}Warning: This script is not being sourced. Directory changes (cd) will not persist.${NC}"
+    echo -e "${RED}Please ensure you have run 'source ~/.zshrc' and are using the 'scaffold' alias.${NC}"
+fi
+
+while getopts s:b:v flag
+do
+    case "${flag}" in
+        s) subdomain=${OPTARG};;
+        b) new_branch=${OPTARG};;
+        v) verbose=true;;
+    esac
+done
+
+if [ ! -d ".git" ] && [ ! -f ".git" ]; then
+    echo -e "${RED}This is not a git repository, aborting...${NC}"
+    smart_exit 1; return 1
+fi
+
+FOLDER=$(pwd)
+PARENT=$(dirname "$FOLDER")
+
+# Automated worktree creation if -b is provided
+if [ -n "$new_branch" ]; then
+    TARGET_DIR="$PARENT/$new_branch"
+    echo -e "${GREEN}Creating new worktree for branch '$new_branch' at '$TARGET_DIR'...${NC}"
+    
+    if [ -d "$TARGET_DIR" ]; then
+        echo -e "${RED}Directory already exists at '$TARGET_DIR'. Switching to it...${NC}"
+        cd "$TARGET_DIR"
+    else
+        # Try to create worktree. If branch exists, it will fail unless we handle it.
+        # Check if branch exists
+        if git show-ref --verify --quiet "refs/heads/$new_branch"; then
+            echo -e "${GREEN}Branch '$new_branch' already exists. Adding worktree...${NC}"
+            git worktree add "$TARGET_DIR" "$new_branch"
+        else
+            echo -e "${GREEN}Creating and adding worktree for new branch '$new_branch'...${NC}"
+            git worktree add -b "$new_branch" "$TARGET_DIR"
+        fi
+        
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}Failed to create worktree. Aborting.${NC}"
+            smart_exit 1; return 1
+        fi
+        cd "$TARGET_DIR"
+    fi
+    # Re-evaluate variables for the new location
+    FOLDER=$(pwd)
+fi
+
+WORKTREE_NAME=$(basename "$FOLDER")
+VALET_SITES_DIR="$HOME/.config/valet/Sites"
+
+# Create storage folders
+echo -e "${GREEN}Creating storage folders...${NC}"
+mkdir -p storage/framework/{cache,sessions,views}
+
+# Environment Files
+ENV_GENERATED=false
+if [ ! -f ".env" ]; then
+    echo -e "${GREEN}.env not found in current directory. Searching for source...${NC}"
+    
+    # Try to find main repo's .env
+    MAIN_REPO_GIT=$(git rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$MAIN_REPO_GIT" ]; then
+        MAIN_REPO_ROOT=$(dirname "$MAIN_REPO_GIT")
+        if [ -f "$MAIN_REPO_ROOT/.env" ]; then
+            echo -e "${GREEN}Copying .env from main repository ($MAIN_REPO_ROOT)...${NC}"
+            cp "$MAIN_REPO_ROOT/.env" .env
+        elif [ -f "$MAIN_REPO_ROOT/.env.example" ]; then
+            echo -e "${GREEN}Copying .env.example from main repository...${NC}"
+            cp "$MAIN_REPO_ROOT/.env.example" .env
+            ENV_GENERATED=true
+        fi
+    fi
+    
+    # Fallback to local .env.example if still not found
+    if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+        echo -e "${GREEN}Falling back to local .env.example...${NC}"
+        cp .env.example .env
+        ENV_GENERATED=true
+    fi
+fi
+
+if [ ! -f ".env" ]; then
+    echo -e "${RED}Critical: Could not find or create .env file. Aborting.${NC}"
+    smart_exit 1; return 1
+fi
+
+# Set up a temporary PHP config to suppress deprecation warnings globally for this section
+TEMP_PHP_INI_DIR=$(mktemp -d)
+echo "error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED" > "$TEMP_PHP_INI_DIR/suppress.ini"
+export PHP_INI_SCAN_DIR=":$TEMP_PHP_INI_DIR"
+export XDEBUG_MODE=off
+
+# Dependencies
+if [ -f "composer.json" ]; then
+    if [ "$verbose" = true ]; then
+        echo -e "${GREEN}Installing Composer dependencies...${NC}"
+        composer install
+    else
+        if [ -n "$ZSH_VERSION" ]; then
+            composer install --quiet &!
+        else
+            composer install --quiet & disown
+        fi
+        show_spinner $! "Installing Composer dependencies..."
+    fi
+fi
+
+if [ "$ENV_GENERATED" = true ]; then
+    echo -e "${GREEN}Generating application key...${NC}"
+    php artisan key:generate --quiet
+fi
+
+# Clean up temporary PHP config
+unset PHP_INI_SCAN_DIR
+rm -rf "$TEMP_PHP_INI_DIR"
+
+if [ -f "package.json" ]; then
+    # Detect package manager
+    MANAGER="yarn"
+    [ -f "package-lock.json" ] && MANAGER="npm"
+    
+    if [ "$verbose" = true ]; then
+        echo -e "${GREEN}Installing $MANAGER dependencies...${NC}"
+        $MANAGER install
+        if grep -q "\"build\":" "package.json"; then
+            echo -e "${GREEN}Running build script...${NC}"
+            $MANAGER run build
+        fi
+    else
+        # Install command
+        if [ "$MANAGER" = "yarn" ]; then
+            INSTALL_CMD="yarn" # 'yarn' is more robust than 'yarn install' for Berry
+        else
+            INSTALL_CMD="npm install --quiet"
+        fi
+
+        if [ -n "$ZSH_VERSION" ]; then
+            $INSTALL_CMD > /dev/null 2>&1 &!
+        else
+            $INSTALL_CMD > /dev/null 2>&1 & disown
+        fi
+        show_spinner $! "Installing $MANAGER dependencies..."
+        
+        # Build command if build script exists
+        if grep -q "\"build\":" "package.json"; then
+            if [ -n "$ZSH_VERSION" ]; then
+                $MANAGER run build > /dev/null 2>&1 &!
+            else
+                $MANAGER run build > /dev/null 2>&1 & disown
+            fi
+            show_spinner $! "Running build script..."
+        fi
+    fi
+    echo -e "${GREEN}Frontend dependencies and build complete.${NC}"
+fi
+
+# Valet Hijacking Logic
+echo -e "${GREEN}Configuring Valet site hijacking...${NC}"
+SITES_TO_LINK=()
+
+# Find all sites in Valet that point to any directory within the parent of this worktree
+if [ -d "$VALET_SITES_DIR" ]; then
+    while read -r symlink; do
+        site_name=$(basename "$symlink")
+        target_path=$(readlink "$symlink")
+        # If the target is in the same parent directory as our current worktree
+        if [[ "$target_path" == "$PARENT"/* ]]; then
+            SITES_TO_LINK+=("$site_name")
+        fi
+    done < <(find "$VALET_SITES_DIR" -maxdepth 1 -type l)
+fi
+
+# If a specific subdomain was provided, add it to the list
+if [ -n "$subdomain" ]; then
+    SITES_TO_LINK+=("$subdomain")
+fi
+
+# Fallback to current folder name ONLY if no existing project sites were found AND no subdomain was provided
+if [ ${#SITES_TO_LINK[@]} -eq 0 ]; then
+    echo -e "${GREEN}No existing links found for hijacking. Falling back to worktree name: $WORKTREE_NAME${NC}"
+    SITES_TO_LINK+=("$WORKTREE_NAME")
+fi
+
+# Link all identified sites to the current worktree
+# We sort -u to avoid duplicates (e.g. if subdomain was already in project sites)
+IFS=$'\n' UNIQUE_SITES=($(printf "%s\n" "${SITES_TO_LINK[@]}" | sort -u))
+unset IFS
+
+total_sites=${#UNIQUE_SITES[@]}
+current_site=0
+ACTIVE_URLS=()
+
+for site in "${UNIQUE_SITES[@]}"; do
+    [ -z "$site" ] && continue
+    current_site=$((current_site + 1))
+    
+    # Identify source worktree before hijacking
+    SOURCE_PATH=$(readlink "$VALET_SITES_DIR/$site" 2>/dev/null)
+    
+    # If already set to current directory, skip hijacking
+    if [[ "$SOURCE_PATH" == "$FOLDER" ]]; then
+        echo -e "${GREEN}Site: $site is already linked to current directory. Skipping hijacking...${NC}"
+        ACTIVE_URLS+=("https://$site.test")
+        continue
+    fi
+
+    if [ -n "$SOURCE_PATH" ]; then
+        SOURCE_WORKTREE=$(basename "$SOURCE_PATH")
+    else
+        SOURCE_WORKTREE="none"
+    fi
+    
+    # Run Valet commands in background
+    if [ -n "$ZSH_VERSION" ]; then
+        (
+            valet unlink "$site" --quiet
+            valet link "$site" --quiet
+            valet secure "$site" --quiet
+        ) &!
+    else
+        (
+            valet unlink "$site" --quiet
+            valet link "$site" --quiet
+            valet secure "$site" --quiet
+        ) & disown
+    fi
+    
+    show_spinner $! "Hijacking site: $site from [$SOURCE_WORKTREE] ($current_site/$total_sites)..."
+    ACTIVE_URLS+=("https://$site.test")
+done
+echo -e "${GREEN}All sites hijacked successfully!${NC}"
+
+# Final Summary
+echo -e "\n${GREEN}========================================${NC}"
+echo -e "${GREEN}           Scaffold Summary             ${NC}"
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}Worktree: ${NC}$WORKTREE_NAME"
+if [ -n "$subdomain" ]; then
+    echo -e "${GREEN}Base URL: ${NC}https://$subdomain.test"
+else
+    echo -e "${GREEN}Base URL: ${NC}N/A"
+fi
+echo -e "${GREEN}Active URLs:${NC}"
+for url in "${ACTIVE_URLS[@]}"; do
+    echo -e "  - $url"
+done
+
+echo -e "\n${GREEN}Git Status:${NC}"
+git status -sb
+
+echo -e "\n${GREEN}Scaffold complete!${NC}"
